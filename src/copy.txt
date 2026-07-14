@@ -1,0 +1,459 @@
+mod sops;
+mod setup;
+
+use clap::{Parser, Subcommand};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, FuzzySelect};
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
+use sops::SopsBackend;
+use qrcode::QrCode;
+use qrcode::render::unicode;
+use std::error::Error;
+
+#[derive(Parser)]
+#[command(name = "po")]
+#[command(about = "PASSop: A SOPS-backed password manager", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Direct shortcut to fetch a password (acts like "call")
+    name: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Initialize the key files, directories, and database
+    Setup,
+    /// Add a new password entry
+    Add { name: String },
+    /// Retrieve a password (uses interactive search if name is omitted)
+    Call { name: Option<String> },
+    /// Remove a password entry
+    Remove { name: String },
+    /// Edit an existing password
+    Edit { name: String },
+    /// Generate a 2FA QR code and ID
+    TwoFactor,
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let cli = Cli::parse();
+
+    // 1. Auto-trigger setup if it hasn't been completed yet
+    if !setup::is_setup_complete() {
+        match cli.command {
+            Some(Commands::Setup) => {} // Let it fall through to manual run below
+            _ => {
+                println!("PASSop configuration not found. Initiating auto-setup...\n");
+                setup::run_setup()?;
+                println!("Auto-setup finished! Re-run your command to start using PASSop.");
+                return Ok(());
+            }
+        }
+    }
+
+    let backend = SopsBackend::new();
+
+    let command = cli.command.unwrap_or_else(|| {
+        Commands::Call { name: cli.name }
+    });
+
+    match command {
+        Commands::Setup => setup::run_setup()?,
+        Commands::Add { name } => handle_add(&backend, name)?,
+        Commands::Call { name } => handle_call(&backend, name)?,
+        Commands::Remove { name } => handle_remove(&backend, name)?,
+        Commands::Edit { name } => handle_edit(&backend, name)?,
+        Commands::TwoFactor => handle_2fa()?,
+    }
+
+    Ok(())
+}
+
+fn generate_password() -> String {
+    thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(20)
+        .map(char::from)
+        .collect()
+}
+
+fn handle_add(backend: &SopsBackend, name: String) -> Result<(), Box<dyn Error>> {
+    let mut secrets = backend.read_secrets().unwrap_or_default();
+
+    let generate = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("Generate password?")
+        .default(true)
+        .interact()?;
+
+    let final_password = if generate {
+        let generated = generate_password();
+        println!("\nGenerated password: \x1b[33m{}\x1b[0m", generated);
+        generated
+    } else {
+        Password::with_theme(&ColorfulTheme::default())
+            .with_prompt("Enter password")
+            .interact()?
+    };
+
+    secrets.insert(name.clone(), final_password);
+    if let Err(e) = backend.write_secrets(&secrets) {
+        eprintln!("Error saving secrets to SOPS: {}", e);
+    } else {
+        println!("\x1b[32m✔ Password for '{}' was saved successfully!\x1b[0m", name);
+    }
+
+    Ok(())
+}
+
+fn handle_call(backend: &SopsBackend, name: Option<String>) -> Result<(), Box<dyn Error>> {
+    let secrets = backend.read_secrets().unwrap_or_default();
+
+    if secrets.is_empty() {
+        println!("Your password vault is currently empty.");
+        return Ok(());
+    }
+
+    let target_name = match name {
+        Some(n) => n,
+        None => {
+            let keys: Vec<&String> = secrets.keys().collect();
+            let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+                .with_prompt("Search for a password")
+                .items(&keys)
+                .default(0)
+                .interact_opt()?;
+
+            match selection {
+                Some(index) => keys[index].clone(),
+                None => return Ok(()), // User canceled
+            }
+        }
+    };
+
+    match secrets.get(&target_name) {
+        Some(password) => {
+            println!("\n🔑 \x1b[1m{}\x1b[0m: \x1b[36m{}\x1b[0m", target_name, password);
+        }
+        None => {
+            println!("\x1b[31mNo entry found for '{}'.\x1b[0m", target_name);
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_remove(backend: &SopsBackend, name: String) -> Result<(), Box<dyn Error>> {
+    let mut secrets = backend.read_secrets().unwrap_or_default();
+
+    if !secrets.contains_key(&name) {
+        println!("\x1b[31mNo entry found for '{}'.\x1b[0m", name);
+        return Ok(());
+    }
+
+    let confirm = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!("Are you sure you want to remove your password for {}?", name))
+        .default(false)
+        .interact()?;
+
+    if confirm {
+        secrets.remove(&name);
+        if let Err(e) = backend.write_secrets(&secrets) {
+            eprintln!("Error saving changes: {}", e);
+        } else {
+            println!("\x1b[32mPassword for '{}' has been removed.\x1b[0m", name);
+        }
+    } else {
+        println!("Canceled.");
+    }
+
+    Ok(())
+}
+
+fn handle_edit(backend: &SopsBackend, name: String) -> Result<(), Box<dyn Error>> {
+    let mut secrets = backend.read_secrets().unwrap_or_default();
+
+    if !secrets.contains_key(&name) {
+        println!("\x1b[31mNo entry found for '{}'. Use 'add' instead.\x1b[0m", name);
+        return Ok(());
+    }
+
+    let new_password: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("What do you want to change your password to?")
+        .interact_text()?;
+
+    let confirm = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!("Do you want to change your password to {}?", new_password))
+        .default(true)
+        .interact()?;
+
+    if confirm {
+        secrets.insert(name, new_password);
+        if let Err(e) = backend.write_secrets(&secrets) {
+            eprintln!("Error: {}", e);
+        } else {
+            println!("\x1b[32mPassword changed!\x1b[0m");
+        }
+    } else {
+        println!("\x1b[33mChange canceled!\x1b[0m");
+    }
+
+    Ok(())
+}
+
+fn handle_2fa() -> Result<(), Box<dyn Error>> {
+    let raw_secret = "JBSWY3DPEHPK3PXP"; 
+    let issuer = "PASSop";
+    let account = "user@domain.com";
+
+    let auth_url = format!(
+        "otpauth://totp/{}:{}?secret={}&issuer={}",
+        issuer, account, raw_secret, issuer
+    );
+
+    let code = QrCode::new(&auth_url).unwrap();
+    let image = code.render::<unicode::Dense1x2>()
+        .dark_color(unicode::Dense1x2::Dark)
+        .light_color(unicode::Dense1x2::Light)
+        .build();
+
+    println!("\nScan this QR code with your authenticator app:");
+    println!("{}", image);
+    println!("Secret Key (Number ID): \x1b[33m{}\x1b[0m\n", raw_secret);
+
+    println!("\x1b[31mPress ESC to exit!\x1b[0m");
+
+    let term = console::Term::stdout();
+    loop {
+        if let Ok(console::Key::Escape) = term.read_key() {
+            break;
+        }
+    }
+
+    Ok(())
+}
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+use std::error::Error;
+use console::style;
+
+pub fn get_passop_dir() -> PathBuf {
+    let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push(".config/passop");
+    path
+}
+
+pub fn get_age_key_dir() -> PathBuf {
+    let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push(".config/sops/age");
+    path
+}
+
+pub fn is_setup_complete() -> bool {
+    let passop_dir = get_passop_dir();
+    let key_file = get_age_key_dir().join("keys.txt");
+    let secrets_file = passop_dir.join("secrets.enc.yaml");
+    let sops_config = passop_dir.join(".sops.yaml");
+
+    key_file.exists() && secrets_file.exists() && sops_config.exists()
+}
+
+pub fn run_setup() -> Result<(), Box<dyn Error>> {
+    println!("{}", style("⚡ Welcome to PASSop Setup! ⚡\n").bold().cyan());
+
+    // 1. Check Dependencies
+    check_dependency("sops", "Please install SOPS: https://github.com/getsops/sops")?;
+    check_dependency("age-keygen", "Please install age: https://github.com/FiloSottile/age")?;
+
+    let passop_dir = get_passop_dir();
+    let age_dir = get_age_key_dir();
+    fs::create_dir_all(&passop_dir)?;
+    fs::create_dir_all(&age_dir)?;
+
+    let key_path = age_dir.join("keys.txt");
+
+    // 2. Generate age key if missing
+    if !key_path.exists() {
+        println!("{}", style("🔑 No age key found. Generating a new one...").yellow());
+        let output = Command::new("age-keygen")
+            .arg("-o")
+            .arg(&key_path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err("Failed to execute age-keygen. Is it installed?".into());
+        }
+    } else {
+        println!("{}", style("✔ Existing age key detected.").green());
+    }
+
+    // 3. Extract public key for .sops.yaml config
+    let key_content = fs::read_to_string(&key_path)?;
+    let public_key = key_content
+        .lines()
+        .find(|line| line.starts_with("# public key: "))
+        .map(|line| line.replace("# public key: ", ""))
+        .ok_or("Could not find public key in keys.txt")?
+        .trim()
+        .to_string();
+
+    // Set env var dynamically for the current runtime
+    std::env::set_var("SOPS_AGE_KEY_FILE", &key_path);
+
+    // 4. Create .sops.yaml in passop directory
+    let sops_config_path = passop_dir.join(".sops.yaml");
+    if !sops_config_path.exists() {
+        println!("{}", style("📝 Creating SOPS configuration file...").yellow());
+        let sops_yaml = format!(
+            "creation_rules:\n  - path_regex: .*\\.enc\\.yaml$\n    age: \"{}\"\n",
+            public_key
+        );
+        fs::write(&sops_config_path, sops_yaml)?;
+    }
+
+    // 5. Initialize the encrypted database
+    let secrets_path = passop_dir.join("secrets.enc.yaml");
+    if !secrets_path.exists() {
+        println!("{}", style("🔒 Initializing encrypted password vault...").yellow());
+        
+        // Let's call SOPS to encrypt an empty YAML map
+        let mut child = Command::new("sops")
+            .args([
+                "--encrypt",
+                "--config", sops_config_path.to_str().unwrap(),
+                "--input-type", "yaml",
+                "--output-type", "yaml",
+                "--filename-override", "secrets.enc.yaml",
+                "/dev/stdin",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+
+        {
+            use std::io::Write;
+            let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
+            stdin.write_all(b"{}")?; // Empty YAML Map
+        }
+
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "SOPS failed to encrypt the database: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ).into());
+        }
+
+        fs::write(&secrets_path, output.stdout)?;
+    }
+
+    println!("\n{}", style("🎉 PASSop is successfully configured and ready to go!").bold().green());
+    println!("Vault location: {}", style(secrets_path.display()).italic());
+    println!("Private Key:    {}\n", style(key_path.display()).italic());
+
+    Ok(())
+}
+
+fn check_dependency(cmd: &str, install_instructions: &str) -> Result<(), Box<dyn Error>> {
+    let check = if cfg!(target_os = "windows") {
+        Command::new("where").arg(cmd).output()
+    } else {
+        Command::new("which").arg(cmd).output()
+    };
+
+    match check {
+        Ok(output) if output.status.success() => Ok(()),
+        _ => Err(format!(
+            "Dependency missing: '{}' was not found in your PATH.\n{}",
+            cmd, install_instructions
+        ).into()),
+    }
+}
+use std::collections::HashMap;
+use std::error::Error;
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+pub struct SopsBackend {
+    // Keeps track of where the encrypted database file lives
+    db_path: std::path::PathBuf,
+    // Keeps track of where our .sops.yaml config file lives
+    config_path: std::path::PathBuf,
+}
+
+impl SopsBackend {
+    pub fn new() -> Self {
+        let home = dirs::home_dir().expect("Could not find home directory");
+        let app_dir = home.join(".config/passop");
+        
+        Self {
+            db_path: app_dir.join("secrets.enc.yaml"),
+            config_path: app_dir.join(".sops.yaml"),
+        }
+    }
+
+    /// Read and decrypt the secrets from the database
+    pub fn read_secrets(&self) -> Result<HashMap<String, String>, Box<dyn Error>> {
+        if !self.db_path.exists() {
+            return Ok(HashMap::new());
+        }
+
+        let output = Command::new("sops")
+            .args([
+                "--decrypt",
+                "--config", self.config_path.to_str().unwrap(),
+                self.db_path.to_str().unwrap(),
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            let err_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("SOPS decryption failed: {}", err_msg).into());
+        }
+
+        let secrets: HashMap<String, String> = serde_yaml::from_slice(&output.stdout)?;
+        Ok(secrets)
+    }
+
+    /// Encrypt and write the secrets back to disk
+    pub fn write_secrets(&self, secrets: &HashMap<String, String>) -> Result<(), Box<dyn Error>> {
+        let yaml_data = serde_yaml::to_string(secrets)?;
+
+        // Spawn SOPS as a child process, writing to stdin and capturing its stdout
+        let mut child = Command::new("sops")
+            .args([
+                "--encrypt",
+                "--config", self.config_path.to_str().unwrap(),
+                "--input-type", "yaml",
+                "--output-type", "yaml",
+                "--filename-override", "secrets.enc.yaml",
+                "/dev/stdin",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        // Feed our YAML string into SOPS's stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(yaml_data.as_bytes())?;
+        }
+
+        // Wait for SOPS to finish processing
+        let output = child.wait_with_output()?;
+
+        if !output.status.success() {
+            let err_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("SOPS encryption failed: {}", err_msg).into());
+        }
+
+        // Write the encrypted output we received from SOPS to our database file
+        std::fs::create_dir_all(self.db_path.parent().unwrap())?;
+        std::fs::write(&self.db_path, output.stdout)?;
+
+        Ok(())
+    }
+}
